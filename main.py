@@ -39,14 +39,23 @@ class ConsultationSchema(BaseModel):
     doctor_id: str
     doctor_name: str = ""
     doctor_qualification: str = ""
+    doctor_reg_no: str = ""
     hospital_name: str = ""
     patient_name: str
+    patient_sex: str = ""
     patient_phone: str
     vitals: str = ""
     diagnosis: str = ""
     soap_note: str = ""
     medications: str = ""
     followup_date: str = ""
+
+class CustomMedicineSchema(BaseModel):
+    doctor_id: str
+    brand_name: str
+    dosage: str = ""
+    frequency: str = "BD"
+    duration: str = ""
 
 @app.get("/")
 def health_check():
@@ -57,7 +66,6 @@ def health_check():
 @app.post("/api/v1/auth/signup")
 def signup(data: AuthSchema):
     try:
-        # Attempt auto-confirm user creation via admin API
         res = supabase.auth.admin.create_user({
             "email": data.email,
             "password": data.password,
@@ -65,45 +73,29 @@ def signup(data: AuthSchema):
         })
         if not res.user:
             raise HTTPException(status_code=400, detail="Registration failed.")
-        return {
-            "status": "success", 
-            "user_id": res.user.id, 
-            "email": res.user.email
-        }
+        return {"status": "success", "user_id": res.user.id, "email": res.user.email}
     except Exception:
-        # Standard signup fallback
         try:
-            res_std = supabase.auth.sign_up({
-                "email": data.email, 
-                "password": data.password
-            })
+            res_std = supabase.auth.sign_up({"email": data.email, "password": data.password})
             if not res_std.user:
                 raise HTTPException(status_code=400, detail="Registration failed.")
-            return {
-                "status": "success", 
-                "user_id": res_std.user.id, 
-                "email": res_std.user.email
-            }
+            return {"status": "success", "user_id": res_std.user.id, "email": res_std.user.email}
         except Exception as err:
             raise HTTPException(status_code=400, detail=str(err))
 
 @app.post("/api/v1/auth/login")
 def login(data: AuthSchema):
     try:
-        res = supabase.auth.sign_in_with_password({
-            "email": data.email, 
-            "password": data.password
-        })
+        res = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
         if not res.session:
             raise HTTPException(status_code=401, detail="Invalid email or password.")
-            
         return {
             "status": "success",
             "access_token": res.session.access_token,
             "user_id": res.user.id,
             "email": res.user.email
         }
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid credentials or email unconfirmed.")
 
 # --- AI PROCESSING ---
@@ -114,6 +106,7 @@ Extract and structure the clinical information (which may be in English, Hindi, 
 
 JSON Keys required:
 "patient_name": (string, patient name if mentioned, else empty string),
+"patient_sex": (string, Male / Female / Other if mentioned, else empty string),
 "patient_phone": (string, phone number if mentioned, else empty string),
 "vitals": (string, blood pressure / pulse / vitals if mentioned),
 "diagnosis": (string, primary clinical diagnosis),
@@ -160,12 +153,10 @@ async def process_audio(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         uploaded_file = gemini_client.files.upload(file=tmp_path)
-        
         response = gemini_client.models.generate_content(
             model="gemini-3.6-flash",
             contents=[uploaded_file, PROMPT_INSTRUCTION]
         )
-        
         os.remove(tmp_path)
         
         cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
@@ -173,7 +164,7 @@ async def process_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI audio processing failed: {str(e)}")
 
-# --- CONSULTATIONS & ANALYTICS ---
+# --- CONSULTATIONS & MEDICINE MASTER ---
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
@@ -182,8 +173,10 @@ def save_consultation(data: ConsultationSchema):
             "doctor_id": data.doctor_id,
             "doctor_name": data.doctor_name,
             "doctor_qualification": data.doctor_qualification,
+            "doctor_reg_no": data.doctor_reg_no,
             "hospital_name": data.hospital_name,
             "patient_name": data.patient_name,
+            "patient_sex": data.patient_sex,
             "patient_phone": data.patient_phone,
             "vitals": data.vitals,
             "diagnosis": data.diagnosis,
@@ -208,23 +201,36 @@ def search_consultations(doctor_id: str, query: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/v1/medicines/add")
+def add_custom_medicine(data: CustomMedicineSchema):
+    try:
+        response = supabase.table("medicines").insert({
+            "doctor_id": data.doctor_id,
+            "brand_name": data.brand_name,
+            "dosage": data.dosage,
+            "frequency": data.frequency,
+            "duration": data.duration
+        }).execute()
+        return {"status": "success", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/medicines/list")
+def list_custom_medicines(doctor_id: str):
+    try:
+        response = supabase.table("medicines").select("*").eq("doctor_id", doctor_id).execute()
+        return {"status": "success", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/analytics/summary")
 def get_analytics_summary(doctor_id: str):
     try:
-        response = supabase.table("consultations") \
-            .select("diagnosis") \
-            .eq("doctor_id", doctor_id) \
-            .execute()
-        
+        response = supabase.table("consultations").select("diagnosis").eq("doctor_id", doctor_id).execute()
         records = response.data
         total_count = len(records)
-        
         if total_count == 0:
-            return {
-                "total_consultations": 0,
-                "top_diagnosis": "N/A",
-                "breakdown": {}
-            }
+            return {"total_consultations": 0, "top_diagnosis": "N/A", "breakdown": {}}
         
         counts = {}
         for r in records:
@@ -232,11 +238,7 @@ def get_analytics_summary(doctor_id: str):
             counts[diag] = counts.get(diag, 0) + 1
             
         top_diag = max(counts, key=counts.get)
-        
-        return {
-            "total_consultations": total_count,
-            "top_diagnosis": top_diag,
-            "breakdown": counts
-        }
+        return {"total_consultations": total_count, "top_diagnosis": top_diag, "breakdown": counts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
