@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -27,6 +27,10 @@ gemini_client = None
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+class AuthSchema(BaseModel):
+    email: str
+    password: str
+
 class DictationSchema(BaseModel):
     raw_text: str
 
@@ -46,6 +50,33 @@ class ConsultationSchema(BaseModel):
 @app.get("/")
 def health_check():
     return {"status": "online", "app": "DocScribe Cloud Engine"}
+
+# --- AUTHENTICATION ENDPOINTS ---
+
+@app.post("/api/v1/auth/signup")
+def signup(data: AuthSchema):
+    try:
+        res = supabase.auth.sign_up({"email": data.email, "password": data.password})
+        if not res.user:
+            raise HTTPException(status_code=400, detail="Signup failed.")
+        return {"status": "success", "user_id": res.user.id, "email": res.user.email}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/v1/auth/login")
+def login(data: AuthSchema):
+    try:
+        res = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
+        return {
+            "status": "success",
+            "access_token": res.session.access_token,
+            "user_id": res.user.id,
+            "email": res.user.email
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid Email or Password.")
+
+# --- CLINICAL ENDPOINTS ---
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
@@ -71,9 +102,7 @@ def process_dictation(data: DictationSchema):
     Return ONLY raw valid JSON with no markdown tags.
     """
 
-    # Primary model set strictly to gemini-3.6-flash as required by Google API
     candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
-    
     last_error = None
     for model_name in candidate_models:
         try:
@@ -154,3 +183,4 @@ def get_analytics_summary(doctor_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
