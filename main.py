@@ -68,12 +68,12 @@ def process_dictation(data: DictationSchema):
     Clinical Dictation:
     {data.raw_text}
 
-    Return ONLY raw valid JSON with no markdown codeblock tags.
+    Return ONLY raw valid JSON with no markdown tags.
     """
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=prompt,
         )
         cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
@@ -113,4 +113,37 @@ def search_consultations(doctor_id: str, query: str):
         return {"status": "success", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/analytics/summary")
+def get_analytics_summary(doctor_id: str):
+    try:
+        response = supabase.table("consultations") \
+            .select("diagnosis") \
+            .eq("doctor_id", doctor_id) \
+            .execute()
         
+        records = response.data
+        total_count = len(records)
+        
+        if total_count == 0:
+            return {
+                "total_consultations": 0,
+                "top_diagnosis": "N/A",
+                "breakdown": {}
+            }
+        
+        counts = {}
+        for r in records:
+            diag = r.get("diagnosis") or "General OPD"
+            counts[diag] = counts.get(diag, 0) + 1
+            
+        top_diag = max(counts, key=counts.get)
+        
+        return {
+            "total_consultations": total_count,
+            "top_diagnosis": top_diag,
+            "breakdown": counts
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+                   
