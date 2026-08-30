@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
+from google.genai import types
 import os
 import json
 
@@ -27,6 +28,9 @@ gemini_client = None
 if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+class DictationSchema(BaseModel):
+    raw_text: str
+
 class ConsultationSchema(BaseModel):
     doctor_id: str
     doctor_name: str = ""
@@ -38,11 +42,7 @@ class ConsultationSchema(BaseModel):
     diagnosis: str = ""
     soap_note: str = ""
     medications: str = ""
-    medications_gujarati: str = ""
     followup_date: str = ""
-
-class DictationSchema(BaseModel):
-    raw_text: str
 
 @app.get("/")
 def health_check():
@@ -54,18 +54,19 @@ def process_dictation(data: DictationSchema):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
     
     prompt = f"""
-    You are an expert AI clinical documentation assistant for an Indian General Practice OPD clinic.
-    Extract and structure the following clinical dictation into raw JSON format.
+    You are an expert AI clinical documentation assistant for an OPD clinic.
+    Extract and structure the following dictation (which may contain English, Hindi, or Gujarati terms) into raw JSON format.
 
     JSON Keys required:
-    "vitals": (string, e.g. "BP: 120/80, Pulse: 72"),
+    "patient_name": (string, patient name if mentioned, else empty string),
+    "patient_phone": (string, phone number if mentioned, else empty string),
+    "vitals": (string, e.g. "120/80" or full vitals summary),
     "diagnosis": (string, primary clinical diagnosis),
-    "soap_note": (string, clinical history & examination summary),
-    "medications": (string, clear dosage and duration in English),
-    "medications_gujarati": (string, clear translation of dosage instructions in Gujarati script for patient clarity),
+    "soap_note": (string, structured SOAP notes with Subjective complaints, Objective findings, Assessment, and Plan),
+    "medications": (string, prescribed drug list with dosage and duration),
     "followup_date": (string, YYYY-MM-DD format if mentioned, else empty string)
 
-    Dictation Text:
+    Clinical Dictation:
     {data.raw_text}
 
     Return ONLY raw valid JSON with no markdown formatting.
@@ -81,19 +82,6 @@ def process_dictation(data: DictationSchema):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
 
-@app.get("/api/v1/consultations/search")
-def search_consultations(doctor_id: str, query: str):
-    try:
-        response = supabase.table("consultations") \
-            .select("*") \
-            .eq("doctor_id", doctor_id) \
-            .or_(f"patient_name.ilike.%{query}%,patient_phone.ilike.%{query}%") \
-            .order("created_at", desc=True) \
-            .execute()
-        return {"status": "success", "data": response.data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
     try:
@@ -108,7 +96,6 @@ def save_consultation(data: ConsultationSchema):
             "diagnosis": data.diagnosis,
             "soap_note": data.soap_note,
             "medications": data.medications,
-            "medications_gujarati": data.medications_gujarati,
             "followup_date": data.followup_date
         }).execute()
         return {"status": "success", "data": response.data}
