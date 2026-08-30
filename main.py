@@ -123,7 +123,7 @@ def process_dictation(data: DictationSchema):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
     
     prompt = f"{PROMPT_INSTRUCTION}\n\nClinical Dictation Text:\n{data.raw_text}"
-    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
     
     last_error = None
     for model_name in candidate_models:
@@ -138,12 +138,14 @@ def process_dictation(data: DictationSchema):
             last_error = e
             continue
 
-    raise HTTPException(status_code=500, detail=f"AI text processing failed: {str(last_error)}")
+    raise HTTPException(status_code=500, detail=f"AI processing failed on all models: {str(last_error)}")
 
 @app.post("/api/v1/ai/process-audio")
 async def process_audio(file: UploadFile = File(...)):
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
+    
+    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
     
     try:
         suffix = os.path.splitext(file.filename)[1] or ".webm"
@@ -153,16 +155,26 @@ async def process_audio(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         uploaded_file = gemini_client.files.upload(file=tmp_path)
-        response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[uploaded_file, PROMPT_INSTRUCTION]
-        )
-        os.remove(tmp_path)
         
-        cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_json)
+        last_error = None
+        for model_name in candidate_models:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[uploaded_file, PROMPT_INSTRUCTION]
+                )
+                os.remove(tmp_path)
+                cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
+                return json.loads(cleaned_json)
+            except Exception as e:
+                last_error = e
+                continue
+
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail=f"AI audio processing failed on all models: {str(last_error)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI audio processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI audio processing error: {str(e)}")
 
 # --- CONSULTATIONS & MEDICINE MASTER ---
 
@@ -241,4 +253,4 @@ def get_analytics_summary(doctor_id: str):
         return {"total_consultations": total_count, "top_diagnosis": top_diag, "breakdown": counts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+                                     
