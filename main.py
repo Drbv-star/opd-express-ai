@@ -71,15 +71,23 @@ def process_dictation(data: DictationSchema):
     Return ONLY raw valid JSON with no markdown tags.
     """
 
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
-        return json.loads(cleaned_json)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
+    # Primary model set strictly to gemini-3.6-flash as required by Google API
+    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
+            return json.loads(cleaned_json)
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise HTTPException(status_code=500, detail=f"AI processing failed on all models: {str(last_error)}")
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
@@ -146,4 +154,3 @@ def get_analytics_summary(doctor_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
