@@ -1,9 +1,8 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
-from google.genai import types
 import os
 import json
 
@@ -55,26 +54,26 @@ def process_dictation(data: DictationSchema):
     
     prompt = f"""
     You are an expert AI clinical documentation assistant for an OPD clinic.
-    Extract and structure the following dictation (which may contain English, Hindi, or Gujarati terms) into raw JSON format.
+    Extract and structure the following dictation into raw JSON format.
 
     JSON Keys required:
     "patient_name": (string, patient name if mentioned, else empty string),
     "patient_phone": (string, phone number if mentioned, else empty string),
-    "vitals": (string, e.g. "120/80" or full vitals summary),
+    "vitals": (string, blood pressure / vitals if mentioned),
     "diagnosis": (string, primary clinical diagnosis),
-    "soap_note": (string, structured SOAP notes with Subjective complaints, Objective findings, Assessment, and Plan),
+    "soap_note": (string, clinical SOAP notes structure),
     "medications": (string, prescribed drug list with dosage and duration),
     "followup_date": (string, YYYY-MM-DD format if mentioned, else empty string)
 
     Clinical Dictation:
     {data.raw_text}
 
-    Return ONLY raw valid JSON with no markdown formatting.
+    Return ONLY raw valid JSON with no markdown codeblock tags.
     """
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
         )
         cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
@@ -101,4 +100,17 @@ def save_consultation(data: ConsultationSchema):
         return {"status": "success", "data": response.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+@app.get("/api/v1/consultations/search")
+def search_consultations(doctor_id: str, query: str):
+    try:
+        response = supabase.table("consultations") \
+            .select("*") \
+            .eq("doctor_id", doctor_id) \
+            .or_(f"patient_name.ilike.%{query}%,patient_phone.ilike.%{query}%") \
+            .order("created_at", desc=True) \
+            .execute()
+        return {"status": "success", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
