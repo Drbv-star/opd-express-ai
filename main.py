@@ -1,9 +1,8 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
-from google.genai import types
 import os
 import json
 import tempfile
@@ -58,17 +57,30 @@ def health_check():
 @app.post("/api/v1/auth/signup")
 def signup(data: AuthSchema):
     try:
-        res = supabase.auth.sign_up({"email": data.email, "password": data.password})
-        if not res.user:
-            raise HTTPException(status_code=400, detail="Signup failed.")
-        return {"status": "success", "user_id": res.user.id, "email": res.user.email}
+        res = supabase.auth.sign_up({
+            "email": data.email, 
+            "password": data.password
+        })
+        if res.user is None:
+            raise HTTPException(status_code=400, detail="Registration failed. Check password length or email format.")
+        return {
+            "status": "success", 
+            "user_id": res.user.id, 
+            "email": res.user.email
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/v1/auth/login")
 def login(data: AuthSchema):
     try:
-        res = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
+        res = supabase.auth.sign_in_with_password({
+            "email": data.email, 
+            "password": data.password
+        })
+        if not res.session:
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+            
         return {
             "status": "success",
             "access_token": res.session.access_token,
@@ -76,7 +88,7 @@ def login(data: AuthSchema):
             "email": res.user.email
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid Email or Password.")
+        raise HTTPException(status_code=401, detail="Invalid credentials or email not confirmed.")
 
 # --- AI PROCESSING ---
 
@@ -125,14 +137,12 @@ async def process_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
     
     try:
-        # Save uploaded audio file temporarily
         suffix = os.path.splitext(file.filename)[1] or ".webm"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Upload audio to Gemini API
         uploaded_file = gemini_client.files.upload(file=tmp_path)
         
         response = gemini_client.models.generate_content(
@@ -140,7 +150,6 @@ async def process_audio(file: UploadFile = File(...)):
             contents=[uploaded_file, PROMPT_INSTRUCTION]
         )
         
-        # Cleanup temporary file
         os.remove(tmp_path)
         
         cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
