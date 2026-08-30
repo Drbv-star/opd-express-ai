@@ -1,12 +1,14 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
+from google.genai import types
 import os
 import json
+import tempfile
 
-app = FastAPI(title="DocScribe EMR Pro Engine")
+app = FastAPI(title="OPD Express AI Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,9 +51,9 @@ class ConsultationSchema(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "app": "DocScribe Cloud Engine"}
+    return {"status": "online", "app": "OPD Express AI Engine"}
 
-# --- AUTHENTICATION ENDPOINTS ---
+# --- AUTHENTICATION ---
 
 @app.post("/api/v1/auth/signup")
 def signup(data: AuthSchema):
@@ -76,33 +78,32 @@ def login(data: AuthSchema):
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid Email or Password.")
 
-# --- CLINICAL ENDPOINTS ---
+# --- AI PROCESSING ---
+
+PROMPT_INSTRUCTION = """
+You are an expert AI clinical documentation assistant for an OPD clinic.
+Extract and structure the clinical information (which may be in English, Hindi, or Gujarati) into raw JSON format.
+
+JSON Keys required:
+"patient_name": (string, patient name if mentioned, else empty string),
+"patient_phone": (string, phone number if mentioned, else empty string),
+"vitals": (string, blood pressure / pulse / vitals if mentioned),
+"diagnosis": (string, primary clinical diagnosis),
+"soap_note": (string, clinical SOAP notes structure),
+"medications": (string, prescribed drug list with dosage and duration),
+"followup_date": (string, YYYY-MM-DD format if mentioned, else empty string)
+
+Return ONLY raw valid JSON with no markdown tags.
+"""
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
     
-    prompt = f"""
-    You are an expert AI clinical documentation assistant for an OPD clinic.
-    Extract and structure the following dictation into raw JSON format.
-
-    JSON Keys required:
-    "patient_name": (string, patient name if mentioned, else empty string),
-    "patient_phone": (string, phone number if mentioned, else empty string),
-    "vitals": (string, blood pressure / vitals if mentioned),
-    "diagnosis": (string, primary clinical diagnosis),
-    "soap_note": (string, clinical SOAP notes structure),
-    "medications": (string, prescribed drug list with dosage and duration),
-    "followup_date": (string, YYYY-MM-DD format if mentioned, else empty string)
-
-    Clinical Dictation:
-    {data.raw_text}
-
-    Return ONLY raw valid JSON with no markdown tags.
-    """
-
+    prompt = f"{PROMPT_INSTRUCTION}\n\nClinical Dictation Text:\n{data.raw_text}"
     candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    
     last_error = None
     for model_name in candidate_models:
         try:
@@ -116,7 +117,38 @@ def process_dictation(data: DictationSchema):
             last_error = e
             continue
 
-    raise HTTPException(status_code=500, detail=f"AI processing failed on all models: {str(last_error)}")
+    raise HTTPException(status_code=500, detail=f"AI text processing failed: {str(last_error)}")
+
+@app.post("/api/v1/ai/process-audio")
+async def process_audio(file: UploadFile = File(...)):
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
+    
+    try:
+        # Save uploaded audio file temporarily
+        suffix = os.path.splitext(file.filename)[1] or ".webm"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        # Upload audio to Gemini API
+        uploaded_file = gemini_client.files.upload(file=tmp_path)
+        
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[uploaded_file, PROMPT_INSTRUCTION]
+        )
+        
+        # Cleanup temporary file
+        os.remove(tmp_path)
+        
+        cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned_json)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI audio processing failed: {str(e)}")
+
+# --- CONSULTATIONS & ANALYTICS ---
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
