@@ -57,19 +57,35 @@ def health_check():
 @app.post("/api/v1/auth/signup")
 def signup(data: AuthSchema):
     try:
-        res = supabase.auth.sign_up({
-            "email": data.email, 
-            "password": data.password
+        # Attempt auto-confirm user creation via admin API
+        res = supabase.auth.admin.create_user({
+            "email": data.email,
+            "password": data.password,
+            "email_confirm": True
         })
-        if res.user is None:
-            raise HTTPException(status_code=400, detail="Registration failed. Check password length or email format.")
+        if not res.user:
+            raise HTTPException(status_code=400, detail="Registration failed.")
         return {
             "status": "success", 
             "user_id": res.user.id, 
             "email": res.user.email
         }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        # Standard signup fallback
+        try:
+            res_std = supabase.auth.sign_up({
+                "email": data.email, 
+                "password": data.password
+            })
+            if not res_std.user:
+                raise HTTPException(status_code=400, detail="Registration failed.")
+            return {
+                "status": "success", 
+                "user_id": res_std.user.id, 
+                "email": res_std.user.email
+            }
+        except Exception as err:
+            raise HTTPException(status_code=400, detail=str(err))
 
 @app.post("/api/v1/auth/login")
 def login(data: AuthSchema):
@@ -88,7 +104,7 @@ def login(data: AuthSchema):
             "email": res.user.email
         }
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid credentials or email not confirmed.")
+        raise HTTPException(status_code=401, detail="Invalid credentials or email unconfirmed.")
 
 # --- AI PROCESSING ---
 
@@ -224,4 +240,3 @@ def get_analytics_summary(doctor_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
