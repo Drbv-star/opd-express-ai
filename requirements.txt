@@ -3,3 +3,5 @@ uvicorn
 supabase
 google-genai
 pydantic
+python-multipart
+feedparser
