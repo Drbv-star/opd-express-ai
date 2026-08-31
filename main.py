@@ -138,7 +138,7 @@ JSON Keys required:
 Return ONLY valid raw JSON without markdown codeblock backticks.
 """
 
-CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash"]
+CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash"]
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
@@ -169,11 +169,7 @@ async def process_audio(file: UploadFile = File(...)):
     
     try:
         content = await file.read()
-        
-        # Clean mime-type string for Gemini SDK
-        mime_type = "audio/webm"
-        if file.content_type:
-            mime_type = file.content_type.split(";")[0].strip()
+        mime_type = file.content_type.split(";")[0].strip() if file.content_type else "audio/webm"
 
         audio_part = types.Part.from_bytes(data=content, mime_type=mime_type)
         contents = [audio_part, PROMPT_INSTRUCTION]
@@ -330,3 +326,4 @@ def add_forum_comment(data: ForumCommentSchema):
         return {"status": "success", "data": res.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+                      
