@@ -62,7 +62,7 @@ class CustomMedicineSchema(BaseModel):
 
 class ForumPostSchema(BaseModel):
     doctor_id: str
-    doctor_name: str
+    doctor_name: str = "Verified Doctor"
     title: str
     content: str
     category: str = "General Case"
@@ -70,7 +70,7 @@ class ForumPostSchema(BaseModel):
 class ForumCommentSchema(BaseModel):
     post_id: str
     doctor_id: str
-    doctor_name: str
+    doctor_name: str = "Verified Doctor"
     comment: str
 
 @app.get("/")
@@ -118,7 +118,7 @@ def login(data: AuthSchema):
 
 PROMPT_INSTRUCTION = """
 You are an expert AI clinical documentation assistant for an OPD clinic.
-Extract clinical information (which may be in English, Hindi, or Gujarati) and format into RAW JSON.
+Extract clinical information (in English, Hindi, or Gujarati) and return strictly raw JSON.
 
 JSON Keys required:
 "patient_name": (string, patient name if mentioned, else ""),
@@ -138,8 +138,7 @@ JSON Keys required:
 Return ONLY valid raw JSON without markdown codeblock backticks.
 """
 
-# Candidate models used in fallback order
-CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
+CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash"]
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
@@ -170,9 +169,12 @@ async def process_audio(file: UploadFile = File(...)):
     
     try:
         content = await file.read()
-        mime_type = file.content_type or "audio/webm"
         
-        # Pass audio bytes directly in-memory to prevent file path errors
+        # Clean mime-type string for Gemini SDK
+        mime_type = "audio/webm"
+        if file.content_type:
+            mime_type = file.content_type.split(";")[0].strip()
+
         audio_part = types.Part.from_bytes(data=content, mime_type=mime_type)
         contents = [audio_part, PROMPT_INSTRUCTION]
 
@@ -193,7 +195,7 @@ async def process_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
 
-# --- CONSULTATIONS & MEDICINES MASTER ---
+# --- CONSULTATIONS & MEDICINES ---
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
@@ -257,7 +259,7 @@ def list_custom_medicines(doctor_id: str):
 def get_analytics_summary(doctor_id: str):
     try:
         response = supabase.table("consultations").select("diagnosis").eq("doctor_id", doctor_id).execute()
-        records = response.data
+        records = response.data or []
         total_count = len(records)
         if total_count == 0:
             return {"total_consultations": 0, "top_diagnosis": "N/A", "breakdown": {}}
@@ -272,7 +274,7 @@ def get_analytics_summary(doctor_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- MEDICAL NEWS RSS FEED ---
+# --- MEDICAL NEWS ---
 
 @app.get("/api/v1/news/medical")
 def get_medical_news():
@@ -287,11 +289,7 @@ def get_medical_news():
             title = item.find('title').text if item.find('title') is not None else "Medical Update"
             link = item.find('link').text if item.find('link') is not None else "#"
             pubDate = item.find('pubDate').text if item.find('pubDate') is not None else ""
-            articles.append({
-                "title": title,
-                "link": link,
-                "pubDate": pubDate
-            })
+            articles.append({"title": title, "link": link, "pubDate": pubDate})
         return {"status": "success", "articles": articles}
     except Exception as e:
         return {"status": "error", "articles": [], "detail": str(e)}
@@ -316,7 +314,7 @@ def create_forum_post(data: ForumPostSchema):
 def list_forum_posts():
     try:
         res = supabase.table("forum_posts").select("*").order("created_at", desc=True).execute()
-        return {"status": "success", "data": res.data}
+        return {"status": "success", "data": res.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
