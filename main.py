@@ -3,9 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 from google import genai
+from google.genai import types
 import os
 import json
-import tempfile
+import urllib.request
+import xml.etree.ElementTree as ET
 
 app = FastAPI(title="OPD Express AI Engine")
 
@@ -42,6 +44,7 @@ class ConsultationSchema(BaseModel):
     doctor_reg_no: str = ""
     hospital_name: str = ""
     patient_name: str
+    patient_age: str = ""
     patient_sex: str = ""
     patient_phone: str
     vitals: str = ""
@@ -56,6 +59,19 @@ class CustomMedicineSchema(BaseModel):
     dosage: str = ""
     frequency: str = "BD"
     duration: str = ""
+
+class ForumPostSchema(BaseModel):
+    doctor_id: str
+    doctor_name: str
+    title: str
+    content: str
+    category: str = "General Case"
+
+class ForumCommentSchema(BaseModel):
+    post_id: str
+    doctor_id: str
+    doctor_name: str
+    comment: str
 
 @app.get("/")
 def health_check():
@@ -98,35 +114,42 @@ def login(data: AuthSchema):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid credentials or email unconfirmed.")
 
-# --- AI PROCESSING ---
+# --- AI PROCESSING ENGINE ---
 
 PROMPT_INSTRUCTION = """
 You are an expert AI clinical documentation assistant for an OPD clinic.
-Extract and structure the clinical information (which may be in English, Hindi, or Gujarati) into raw JSON format.
+Extract clinical information (which may be in English, Hindi, or Gujarati) and format into RAW JSON.
 
 JSON Keys required:
-"patient_name": (string, patient name if mentioned, else empty string),
-"patient_sex": (string, Male / Female / Other if mentioned, else empty string),
-"patient_phone": (string, phone number if mentioned, else empty string),
-"vitals": (string, blood pressure / pulse / vitals if mentioned),
+"patient_name": (string, patient name if mentioned, else ""),
+"patient_age": (string, e.g. "35 Y" or "5 M" if mentioned, else ""),
+"patient_sex": (string, "Male", "Female", or "Other" if mentioned, else ""),
+"patient_phone": (string, phone number if mentioned, else ""),
+"v_bp": (string, blood pressure e.g. "120/80" if mentioned, else ""),
+"v_pulse": (string, pulse rate e.g. "72" if mentioned, else ""),
+"v_spo2": (string, SpO2 percentage e.g. "98" if mentioned, else ""),
+"v_temp": (string, temperature e.g. "98.6" if mentioned, else ""),
+"v_rbs": (string, random blood sugar e.g. "110" if mentioned, else ""),
 "diagnosis": (string, primary clinical diagnosis),
 "soap_note": (string, clinical SOAP notes structure),
 "medications": (string, prescribed drug list with dosage and duration),
-"followup_date": (string, YYYY-MM-DD format if mentioned, else empty string)
+"followup_date": (string, YYYY-MM-DD format if mentioned, else "")
 
-Return ONLY raw valid JSON with no markdown tags.
+Return ONLY valid raw JSON without markdown codeblock backticks.
 """
+
+# Candidate models used in fallback order
+CANDIDATE_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-2.5-flash"]
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
     if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing on server.")
     
     prompt = f"{PROMPT_INSTRUCTION}\n\nClinical Dictation Text:\n{data.raw_text}"
-    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
-    
     last_error = None
-    for model_name in candidate_models:
+
+    for model_name in CANDIDATE_MODELS:
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
@@ -138,45 +161,39 @@ def process_dictation(data: DictationSchema):
             last_error = e
             continue
 
-    raise HTTPException(status_code=500, detail=f"AI processing failed on all models: {str(last_error)}")
+    raise HTTPException(status_code=500, detail=f"AI processing failed across all models: {str(last_error)}")
 
 @app.post("/api/v1/ai/process-audio")
 async def process_audio(file: UploadFile = File(...)):
     if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is missing on server.")
-    
-    candidate_models = ["gemini-3.6-flash", "gemini-2.5-flash"]
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing on server.")
     
     try:
-        suffix = os.path.splitext(file.filename)[1] or ".webm"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        uploaded_file = gemini_client.files.upload(file=tmp_path)
+        content = await file.read()
+        mime_type = file.content_type or "audio/webm"
         
+        # Pass audio bytes directly in-memory to prevent file path errors
+        audio_part = types.Part.from_bytes(data=content, mime_type=mime_type)
+        contents = [audio_part, PROMPT_INSTRUCTION]
+
         last_error = None
-        for model_name in candidate_models:
+        for model_name in CANDIDATE_MODELS:
             try:
                 response = gemini_client.models.generate_content(
                     model=model_name,
-                    contents=[uploaded_file, PROMPT_INSTRUCTION]
+                    contents=contents
                 )
-                os.remove(tmp_path)
                 cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
                 return json.loads(cleaned_json)
             except Exception as e:
                 last_error = e
                 continue
 
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise HTTPException(status_code=500, detail=f"AI audio processing failed on all models: {str(last_error)}")
+        raise HTTPException(status_code=500, detail=f"AI audio processing failed across all models: {str(last_error)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI audio processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
 
-# --- CONSULTATIONS & MEDICINE MASTER ---
+# --- CONSULTATIONS & MEDICINES MASTER ---
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
@@ -188,6 +205,7 @@ def save_consultation(data: ConsultationSchema):
             "doctor_reg_no": data.doctor_reg_no,
             "hospital_name": data.hospital_name,
             "patient_name": data.patient_name,
+            "patient_age": data.patient_age,
             "patient_sex": data.patient_sex,
             "patient_phone": data.patient_phone,
             "vitals": data.vitals,
@@ -253,4 +271,64 @@ def get_analytics_summary(doctor_id: str):
         return {"total_consultations": total_count, "top_diagnosis": top_diag, "breakdown": counts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-                                     
+
+# --- MEDICAL NEWS RSS FEED ---
+
+@app.get("/api/v1/news/medical")
+def get_medical_news():
+    rss_url = "https://news.google.com/rss/search?q=medical+science+clinical+guidelines+ICMR+WHO&hl=en-IN&gl=IN&ceid=IN:en"
+    try:
+        req = urllib.request.Request(rss_url, headers={'User-Agent': 'Mozilla/5.0'})
+        html = urllib.request.urlopen(req).read()
+        root = ET.fromstring(html)
+        
+        articles = []
+        for item in root.findall('.//channel/item')[:10]:
+            title = item.find('title').text if item.find('title') is not None else "Medical Update"
+            link = item.find('link').text if item.find('link') is not None else "#"
+            pubDate = item.find('pubDate').text if item.find('pubDate') is not None else ""
+            articles.append({
+                "title": title,
+                "link": link,
+                "pubDate": pubDate
+            })
+        return {"status": "success", "articles": articles}
+    except Exception as e:
+        return {"status": "error", "articles": [], "detail": str(e)}
+
+# --- DOCTORS' LOUNGE FORUM ---
+
+@app.post("/api/v1/forum/posts/create")
+def create_forum_post(data: ForumPostSchema):
+    try:
+        res = supabase.table("forum_posts").insert({
+            "doctor_id": data.doctor_id,
+            "doctor_name": data.doctor_name,
+            "title": data.title,
+            "content": data.content,
+            "category": data.category
+        }).execute()
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/forum/posts/list")
+def list_forum_posts():
+    try:
+        res = supabase.table("forum_posts").select("*").order("created_at", desc=True).execute()
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/forum/comments/add")
+def add_forum_comment(data: ForumCommentSchema):
+    try:
+        res = supabase.table("forum_comments").insert({
+            "post_id": data.post_id,
+            "doctor_id": data.doctor_id,
+            "doctor_name": data.doctor_name,
+            "comment": data.comment
+        }).execute()
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
