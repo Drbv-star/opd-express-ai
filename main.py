@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 import os
 import json
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -23,18 +24,28 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print("Supabase Init Error:", e)
 
 gemini_client = None
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print("Gemini Init Error:", e)
+
+# --- SCHEMAS ---
 
 class AuthSchema(BaseModel):
     email: str
     password: str
 
 class DictationSchema(BaseModel):
+    doctor_email: str = ""
     raw_text: str
 
 class ConsultationSchema(BaseModel):
@@ -81,6 +92,8 @@ def health_check():
 
 @app.post("/api/v1/auth/signup")
 def signup(data: AuthSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         res = supabase.auth.admin.create_user({
             "email": data.email,
@@ -101,6 +114,8 @@ def signup(data: AuthSchema):
 
 @app.post("/api/v1/auth/login")
 def login(data: AuthSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         res = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
         if not res.session:
@@ -114,9 +129,9 @@ def login(data: AuthSchema):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid credentials or email unconfirmed.")
 
-# --- AI PROCESSING ENGINE ---
+# --- PROMPTS & MULTI-MODEL CASCADE ENGINE ---
 
-PROMPT_INSTRUCTION = """
+GENERAL_PROMPT = """
 You are an expert AI clinical documentation assistant for an OPD clinic.
 Extract clinical information (in English, Hindi, or Gujarati) and return strictly raw JSON.
 
@@ -138,32 +153,80 @@ JSON Keys required:
 Return ONLY valid raw JSON without markdown codeblock backticks.
 """
 
-CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-3.5-flash"]
+TAP_ORTHO_PROMPT = """
+You are an expert AI clinical documentation assistant for Orthopaedic and Industrial OPD clinics.
+Extract clinical entities from mixed Gujarati, Hindi, and English dictations into valid raw JSON.
+Map transliterated phrases (e.g., 'ખભામાં દુખાવો' -> Shoulder Pain, 'હાડકું ક્રેક' -> Suspected Fracture) into standard English clinical SOAP categories.
+
+JSON Keys required:
+"patient_name": (string, patient name if mentioned, else ""),
+"patient_age": (string, e.g. "35 Y" or "5 M" if mentioned, else ""),
+"patient_sex": (string, "Male", "Female", or "Other" if mentioned, else ""),
+"patient_phone": (string, phone number if mentioned, else ""),
+"v_bp": (string, blood pressure e.g. "120/80" if mentioned, else ""),
+"v_pulse": (string, pulse rate e.g. "72" if mentioned, else ""),
+"v_spo2": (string, SpO2 percentage e.g. "98" if mentioned, else ""),
+"v_temp": (string, temperature e.g. "98.6" if mentioned, else ""),
+"v_rbs": (string, random blood sugar e.g. "110" if mentioned, else ""),
+"diagnosis": (string, primary clinical diagnosis including laterality Right/Left/Bilateral),
+"soap_note": (string, clinical SOAP notes structure including Range of Motion, joint stability, and deformity findings),
+"medications": (string, prescribed drug list with dosage and duration),
+"followup_date": (string, YYYY-MM-DD format if mentioned, else ""),
+
+-- SPECIALIZED ORTHO & INDUSTRIAL FIELDS --
+"ortho_rom": (string, Range of Motion e.g. Flexion/Extension/Rotation if mentioned, else ""),
+"ortho_joint_tests": (string, ACL/MCL, stability, impingement tests if mentioned, else ""),
+"ortho_findings": (string, swelling, tenderness, deformity locations, X-ray/MRI notes if mentioned, else ""),
+"industrial_company": (string, Factory/Company name & Employee ID if mentioned, else ""),
+"industrial_mechanism": (string, Crush, Cut, Chemical, Fall mechanism if mentioned, else ""),
+"industrial_fitness": (string, Fit for Duty / Unfit / Light Duty if mentioned, else "")
+
+Return ONLY valid raw JSON without markdown codeblock backticks.
+"""
+
+# INCLUDES GEMINI-3.6-FLASH AT TOP OF CASCADE WITH FALLBACKS
+CANDIDATE_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+]
+
+def execute_gemini_with_resilience(contents):
+    """Executes Gemini generation across candidate models with retries."""
+    last_error = None
+    for model_name in CANDIDATE_MODELS:
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                )
+                if response and response.text:
+                    cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
+                    return json.loads(cleaned_json)
+            except Exception as e:
+                last_error = e
+                time.sleep(1.0)
+                continue
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"AI processing error across all models: {str(last_error)}"
+    )
 
 @app.post("/api/v1/ai/process-dictation")
 def process_dictation(data: DictationSchema):
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing on server.")
     
-    prompt = f"{PROMPT_INSTRUCTION}\n\nClinical Dictation Text:\n{data.raw_text}"
-    last_error = None
-
-    for model_name in CANDIDATE_MODELS:
-        try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
-            return json.loads(cleaned_json)
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise HTTPException(status_code=500, detail=f"AI processing failed across all models: {str(last_error)}")
+    selected_prompt = TAP_ORTHO_PROMPT if "tap.hospital" in data.doctor_email.lower() else GENERAL_PROMPT
+    prompt = f"{selected_prompt}\n\nClinical Dictation Text:\n{data.raw_text}"
+    
+    return execute_gemini_with_resilience(prompt)
 
 @app.post("/api/v1/ai/process-audio")
-async def process_audio(file: UploadFile = File(...)):
+async def process_audio(file: UploadFile = File(...), doctor_email: str = ""):
     if not gemini_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing on server.")
     
@@ -172,29 +235,21 @@ async def process_audio(file: UploadFile = File(...)):
         mime_type = file.content_type.split(";")[0].strip() if file.content_type else "audio/webm"
 
         audio_part = types.Part.from_bytes(data=content, mime_type=mime_type)
-        contents = [audio_part, PROMPT_INSTRUCTION]
+        selected_prompt = TAP_ORTHO_PROMPT if "tap.hospital" in doctor_email.lower() else GENERAL_PROMPT
+        contents = [audio_part, selected_prompt]
 
-        last_error = None
-        for model_name in CANDIDATE_MODELS:
-            try:
-                response = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=contents
-                )
-                cleaned_json = response.text.strip().replace("```json", "").replace("```", "")
-                return json.loads(cleaned_json)
-            except Exception as e:
-                last_error = e
-                continue
-
-        raise HTTPException(status_code=500, detail=f"AI audio processing failed across all models: {str(last_error)}")
+        return execute_gemini_with_resilience(contents)
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Audio byte processing error: {str(e)}")
 
 # --- CONSULTATIONS & MEDICINES ---
 
 @app.post("/api/v1/consultations/save")
 def save_consultation(data: ConsultationSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         response = supabase.table("consultations").insert({
             "doctor_id": data.doctor_id,
@@ -218,6 +273,8 @@ def save_consultation(data: ConsultationSchema):
 
 @app.get("/api/v1/consultations/search")
 def search_consultations(doctor_id: str, query: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         response = supabase.table("consultations") \
             .select("*") \
@@ -231,6 +288,8 @@ def search_consultations(doctor_id: str, query: str):
 
 @app.post("/api/v1/medicines/add")
 def add_custom_medicine(data: CustomMedicineSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         response = supabase.table("medicines").insert({
             "doctor_id": data.doctor_id,
@@ -245,6 +304,8 @@ def add_custom_medicine(data: CustomMedicineSchema):
 
 @app.get("/api/v1/medicines/list")
 def list_custom_medicines(doctor_id: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         response = supabase.table("medicines").select("*").eq("doctor_id", doctor_id).execute()
         return {"status": "success", "data": response.data}
@@ -253,6 +314,8 @@ def list_custom_medicines(doctor_id: str):
 
 @app.get("/api/v1/analytics/summary")
 def get_analytics_summary(doctor_id: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         response = supabase.table("consultations").select("diagnosis").eq("doctor_id", doctor_id).execute()
         records = response.data or []
@@ -270,7 +333,7 @@ def get_analytics_summary(doctor_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- MEDICAL NEWS ---
+# --- MEDICAL NEWS FEED ---
 
 @app.get("/api/v1/news/medical")
 def get_medical_news():
@@ -294,6 +357,8 @@ def get_medical_news():
 
 @app.post("/api/v1/forum/posts/create")
 def create_forum_post(data: ForumPostSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         res = supabase.table("forum_posts").insert({
             "doctor_id": data.doctor_id,
@@ -308,6 +373,8 @@ def create_forum_post(data: ForumPostSchema):
 
 @app.get("/api/v1/forum/posts/list")
 def list_forum_posts():
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         res = supabase.table("forum_posts").select("*").order("created_at", desc=True).execute()
         return {"status": "success", "data": res.data or []}
@@ -316,6 +383,8 @@ def list_forum_posts():
 
 @app.post("/api/v1/forum/comments/add")
 def add_forum_comment(data: ForumCommentSchema):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection uninitialized.")
     try:
         res = supabase.table("forum_comments").insert({
             "post_id": data.post_id,
@@ -326,4 +395,4 @@ def add_forum_comment(data: ForumCommentSchema):
         return {"status": "success", "data": res.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-                      
+    
